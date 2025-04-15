@@ -1,0 +1,297 @@
+---
+title: "BSTS"
+author: "Andi Zhang"
+date: "2025-03-10"
+output: html_document
+---
+
+```{r, echo=TRUE}
+# Load libraries
+library(bsts)
+library(tidyverse)
+library(lubridate)
+library(Metrics)
+library(ggplot2)
+```
+
+
+```{r, echo=TRUE}
+# Load the new dataset
+df <- read.csv("new_merged_data.csv", stringsAsFactors = FALSE)
+
+# Convert Date column to Date type and sort in ascending order
+df$date <- as.Date(df$date)
+df <- df %>% arrange(date)
+
+# View the first few rows to check structure
+tail(df)
+```
+
+```{r, echo=TRUE}
+# Define time periods
+train_end <- as.Date("2023-03-01")
+test_start <- as.Date("2023-04-01")
+test_end <- as.Date("2023-09-01")
+forecast_start <- as.Date("2023-10-01")
+forecast_end <- as.Date("2024-09-01")
+
+# Training Data (2003-2023)
+train_data <- df %>% filter(date <= train_end)
+
+# Testing Data (2023-04 to 2023-09)
+test_data <- df %>% filter(date >= test_start & date <= test_end)
+
+# Forecast Dates (Future 12 months)
+forecast_dates <- seq(from = forecast_start, to = forecast_end, by = "month")
+```
+
+
+```{r, echo=TRUE}
+train_bsts <- function(target_var, df, burn_in = 50, niter = 500) {
+  print(paste("Training BSTS for", target_var, "..."))
+
+  # Prepare dependent variable (Y)
+  y <- df[[target_var]]
+
+  # Prepare external regressors (X)
+  X <- df %>% select(transformed_price, monthly_real_gdp)
+  X_matrix <- as.matrix(X)
+
+  # Define state-space components: local linear trend + seasonal + regressors
+  ss <- AddLocalLinearTrend(list(), y)  # Trend component
+  ss <- AddSeasonal(ss, y, nseasons = 12)  # Seasonality
+
+  # Fit BSTS model
+  model <- bsts(y ~ X_matrix, state.specification = ss, niter = niter)
+
+  return(model)
+}
+
+# Train BSTS models for all four target variables
+bsts_models <- list()
+for (target in c("pax", "flt", "lf", "rpm")) {
+  bsts_models[[target]] <- train_bsts(target, train_data)
+}
+```
+
+```{r, echo=TRUE}
+# Load external forecast data (real GDP & transformed price for the forecast period)
+external_forecast <- read.csv("external_forecast.csv", stringsAsFactors = FALSE)
+
+# Convert Date column to Date type
+external_forecast$date <- as.Date(external_forecast$date)
+
+# Select only the required columns
+X_future <- external_forecast %>% 
+  select(transformed_price, monthly_real_gdp) 
+
+# Convert to matrix (required by BSTS)
+X_future <- as.matrix(X_future)
+```
+
+```{r, echo=TRUE}
+forecast_bsts <- function(model, h = 12, burn_in = 50, X_future) {
+  pred <- predict(model, horizon = h, burn = burn_in, newdata = X_future)  # Supply actual forecasted external regressors
+  return(pred$mean)  # Extract mean predictions
+}
+```
+
+
+```{r, echo=TRUE}
+# Store forecasts
+bsts_forecasts <- list()
+
+for (target in c("pax", "flt", "lf", "rpm")) {
+  print(paste("Forecasting BSTS for", target, "..."))
+  bsts_forecasts[[target]] <- forecast_bsts(bsts_models[[target]], h = 12, X_future = X_future)
+}
+
+# Convert forecasts to DataFrame
+bsts_forecast_df <- data.frame(date = external_forecast$date, bsts_forecasts)
+```
+
+```{r, echo=TRUE}
+library(ggplot2)
+
+# Ensure the historical dataset includes the correct structure
+plot_data <- df %>%
+  select(date, pax, flt, lf, rpm) %>%  # Select relevant columns
+  pivot_longer(cols = -date, names_to = "Variable", values_to = "Actual") %>%
+  mutate(Type = "Historical")  # Label historical data
+
+# Ensure the BSTS forecast dataset includes the correct structure
+bsts_forecast_long <- bsts_forecast_df %>%
+  pivot_longer(cols = -date, names_to = "Variable", values_to = "Forecast") %>%
+  mutate(Type = "Forecast")  # Label forecasted data
+
+# Rename "Forecast" column to "Actual" for consistency in ggplot
+bsts_forecast_long <- rename(bsts_forecast_long, Actual = Forecast)
+
+# Combine both datasets into a single dataframe
+plot_data <- bind_rows(plot_data, bsts_forecast_long)
+
+# Convert test data to long format and rename the value column
+test_data_long <- test_data %>%
+  select(date, pax, flt, lf, rpm) %>%
+  pivot_longer(cols = -date, names_to = "Variable", values_to = "value") %>%
+  mutate(Type = "Test Data")
+
+# Convert BSTS test period forecast to long format and rename column to 'value'
+bsts_test_forecast_long <- data.frame(date = test_data$date, bsts_forecasts) %>%
+  pivot_longer(cols = -date, names_to = "Variable", values_to = "value") %>%
+  mutate(Type = "BSTS Forecast")
+
+# Convert full historical data to long format and rename column to 'value'
+historical_data_long <- df %>%
+  select(date, pax, flt, lf, rpm) %>%
+  pivot_longer(cols = -date, names_to = "Variable", values_to = "value") %>%
+  mutate(Type = "Historical Data")
+
+# Combine all datasets into a single dataframe for plotting
+plot_test_data <- bind_rows(historical_data_long, test_data_long, bsts_test_forecast_long)
+
+# Filter data to keep only records from 2015 onward
+plot_test_data <- plot_test_data %>% filter(date >= as.Date("2015-01-01"))
+
+# Define color mapping
+color_mapping <- c("Historical" = "blue", "Forecast" = "red")
+
+# Function to create a separate plot for each variable
+plot_bsts_forecast <- function(variable_name) {
+  # Subset data for the specific variable
+  data_subset <- plot_data %>% filter(Variable == variable_name)
+  
+  # Generate the plot
+  ggplot(data_subset, aes(x = date, y = Actual, color = Type)) +
+    geom_line(linewidth = 0.8) +  # Use thicker lines for better visibility
+    labs(title = paste("BSTS Forecast vs. Historical Data for", variable_name),
+         x = "Date", y = variable_name) +
+    theme_minimal() +
+    scale_color_manual(values = color_mapping) +
+    theme(legend.position = "bottom", text = element_text(size = 14))  # Improve readability
+}
+
+# Generate and display the four plots separately
+plot_pax <- plot_bsts_forecast("pax")
+plot_flt <- plot_bsts_forecast("flt")
+plot_lf <- plot_bsts_forecast("lf")
+plot_rpm <- plot_bsts_forecast("rpm")
+
+# Display the plots
+print(plot_pax)
+print(plot_flt)
+print(plot_lf)
+print(plot_rpm)
+```
+
+```{r, echo=TRUE}
+# Extract test period regressors
+X_test <- test_data %>% select(transformed_price, monthly_real_gdp)
+
+# Convert to matrix format (required by BSTS)
+X_test <- as.matrix(X_test)
+
+evaluate_bsts <- function(model, y_true, X_test) {
+  # Predict on test data using actual external regressors
+  pred <- predict(model, horizon = nrow(y_true), burn = 50, newdata = X_test)
+
+  # Extract forecasted values
+  y_pred <- pred$mean
+
+  # Compute evaluation metrics
+  mae_value <- mae(y_true, y_pred)
+  rmse_value <- rmse(y_true, y_pred)
+  mape_value <- mean(abs((y_true - y_pred) / y_true)) * 100
+  mpe_value <- mean((y_true - y_pred) / y_true) * 100
+
+  # Compute AIC and BIC manually
+  n <- length(y_true)  # Number of observations
+  k <- length(model$state.specification) + ncol(X_test)  # Number of parameters (state-space + regressors)
+
+  # Extract negative log-likelihood from BSTS
+  neg_log_likelihood <- -0.5 * sum((y_true - y_pred)^2 / var(y_true))
+
+  # Compute AIC and BIC
+  aic_value <- -2 * neg_log_likelihood + 2 * k
+  bic_value <- -2 * neg_log_likelihood + k * log(n)
+
+  # Compute AICc (corrected AIC) for small sample sizes
+  aicc_value <- aic_value + (2 * k * (k + 1)) / (n - k - 1)
+
+  return(c(MAE = mae_value, RMSE = rmse_value, MAPE = mape_value, MPE = mpe_value,
+           AIC = aic_value, BIC = bic_value, AICc = aicc_value))
+}
+
+# Initialize evaluation results table
+evaluation_results <- data.frame()
+
+# Loop through each target variable to compute metrics
+for (target in c("pax", "flt", "lf", "rpm")) {
+  y_true <- test_data[[target]]
+
+  # Call evaluation function with actual regressors
+  metrics <- evaluate_bsts(bsts_models[[target]], y_true, X_test)
+
+  # Store results in the summary table
+  evaluation_results <- rbind(evaluation_results, data.frame(Target = target, metrics))
+}
+
+# Print evaluation summary table
+print(evaluation_results)
+```
+
+```{r, echo=TRUE}
+# Function to plot test period forecasts for each variable
+plot_bsts_test_comparison <- function(variable_name) {
+  data_subset <- plot_test_data %>% filter(Variable == variable_name)  # Use plot_test_data
+  
+  ggplot(data_subset, aes(x = date, y = value, color = Type)) +
+    geom_line(linewidth = 1.2) +  # Thicker lines for better visibility
+    labs(title = paste("BSTS Test Period Forecast vs. Historical & Test Data for", variable_name),
+         x = "Date", y = variable_name) +
+    theme_minimal() +
+    scale_color_manual(values = c("Historical Data" = "black", 
+                                  "Test Data" = "blue", 
+                                  "BSTS Forecast" = "red")) +
+    theme(legend.position = "bottom", text = element_text(size = 14))  # Improve readability
+}
+
+# Define color mapping
+color_mapping <- c("Historical Data" = "black", "Test Data" = "blue", "BSTS Forecast" = "red")
+
+# Function to plot test period forecasts for each variable
+plot_bsts_test_comparison <- function(variable_name) {
+  data_subset <- plot_test_data %>% filter(Variable == variable_name)
+  
+  ggplot(data_subset, aes(x = date, y = value, color = Type)) +
+    geom_line(linewidth = 0.8) +  # Thicker lines for better visibility
+    labs(title = paste("BSTS Test Period Forecast vs. Historical & Test Data for", variable_name),
+         x = "Date", y = variable_name) +
+    theme_minimal() +
+    scale_color_manual(values = color_mapping) +
+    theme(legend.position = "bottom", text = element_text(size = 14))  # Improve readability
+}
+
+# Generate and display plots
+plot_pax_test <- plot_bsts_test_comparison("pax")
+plot_flt_test <- plot_bsts_test_comparison("flt")
+plot_lf_test <- plot_bsts_test_comparison("lf")
+plot_rpm_test <- plot_bsts_test_comparison("rpm")
+
+# Display the plots
+print(plot_pax_test)
+print(plot_flt_test)
+print(plot_lf_test)
+print(plot_rpm_test)
+
+```
+
+
+```{r, echo=TRUE}
+
+```
+
+
+```{r, echo=TRUE}
+
+```
